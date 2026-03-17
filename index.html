@@ -1164,4 +1164,171 @@ st.markdown("""
 VLDS Quarterly Process  ·  4S Dealerships  ·  Forest Dealerships  ·  Confidential
 </div>""", unsafe_allow_html=True)
 
-   
+
+
+reader.py.  ##########################
+
+"""
+reader.py
+─────────
+Bulletproof file reader.  The root cause of "cannot open file" errors is that
+Streamlit's UploadedFile object is a lazy stream — reading it directly with
+pd.read_excel() fails on many real-world files.
+
+Fix: always f.read() → BytesIO first, then pass to pandas.
+Tries multiple engines so .xlsx, .xlsb, .xls, .csv all work.
+"""
+
+import io
+import pandas as pd
+
+
+# ── public helpers ────────────────────────────────────────────────────────────
+
+def get_bytes(f) -> bytes:
+    """Read all bytes from a Streamlit UploadedFile (resets pointer first)."""
+    f.seek(0)
+    return f.read()
+
+
+def get_sheet_names(f) -> list[str]:
+    """Return sheet names without crashing.  Empty list for CSV/ODS."""
+    nm = f.name.lower()
+    raw = get_bytes(f)
+
+    if nm.endswith(".csv"):
+        return []
+
+    if nm.endswith(".xlsb"):
+        try:
+            import pyxlsb
+            with pyxlsb.open_workbook(io.BytesIO(raw)) as wb:
+                return list(wb.sheets)
+        except Exception:
+            return []
+
+    # xlsx / xls / xlsm — openpyxl is always available
+    for eng in ("openpyxl",):
+        try:
+            xl = pd.ExcelFile(io.BytesIO(raw), engine=eng)
+            return xl.sheet_names
+        except Exception:
+            pass
+    return []
+
+
+def read_file(f, sheet_name=0) -> pd.DataFrame:
+    """
+    Read any uploaded file into a DataFrame.
+    sheet_name can be int (index) or str (name).
+    Returns a single DataFrame.  Raises IOError only if every engine fails.
+    """
+    nm  = get_bytes.__doc__  # dummy; real name below
+    nm  = f.name.lower()
+    raw = get_bytes(f)
+    buf = io.BytesIO(raw)
+    errors = []
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
+    if nm.endswith(".csv"):
+        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+            try:
+                return pd.read_csv(io.BytesIO(raw), encoding=enc,
+                                   on_bad_lines="skip", low_memory=False)
+            except Exception as e:
+                errors.append(f"csv/{enc}: {e}")
+        raise IOError("CSV read failed: " + " | ".join(errors))
+
+    # ── XLSB ─────────────────────────────────────────────────────────────────
+    if nm.endswith(".xlsb"):
+        try:
+            import pyxlsb
+            df = pd.read_excel(io.BytesIO(raw), engine="pyxlsb",
+                               sheet_name=sheet_name)
+            return _pick(df)
+        except Exception as e:
+            errors.append(f"pyxlsb: {e}")
+            raise IOError(
+                "Cannot read .xlsb file.\n"
+                "Fix: open in Excel → File → Save As → Excel Workbook (.xlsx) → re-upload.\n"
+                f"Detail: {e}"
+            )
+
+    # ── XLS (old Excel 97-2003) ───────────────────────────────────────────────
+    if nm.endswith(".xls"):
+        for eng in ("xlrd", "openpyxl"):
+            try:
+                df = pd.read_excel(io.BytesIO(raw), engine=eng,
+                                   sheet_name=sheet_name)
+                return _pick(df)
+            except Exception as e:
+                errors.append(f"{eng}: {e}")
+        raise IOError(
+            "Cannot read .xls file.  "
+            "Fix: open in Excel → File → Save As → Excel Workbook (.xlsx) → re-upload.\n"
+            "Detail: " + " | ".join(errors)
+        )
+
+    # ── XLSX / XLSM (default) ─────────────────────────────────────────────────
+    try:
+        df = pd.read_excel(io.BytesIO(raw), engine="openpyxl",
+                           sheet_name=sheet_name)
+        return _pick(df)
+    except Exception as e:
+        errors.append(f"openpyxl: {e}")
+
+    # Last-resort: treat as CSV (e.g. mis-named .xlsx that is really CSV)
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, on_bad_lines="skip")
+        except Exception as e:
+            errors.append(f"csv-fallback/{enc}: {e}")
+
+    raise IOError(
+        "Could not open this file.\n\n"
+        "Most common fixes:\n"
+        "  1. Close the file in Excel first, then re-upload\n"
+        "  2. Excel → File → Save As → Excel Workbook (.xlsx) → re-upload\n"
+        "  3. Remove any password protection in Excel first\n"
+        "  4. If exported from Oracle/SAP: choose .xlsx export format\n\n"
+        "Technical details: " + " | ".join(errors[-3:])
+    )
+
+
+def read_named_sheet(f, sheet_name: str) -> pd.DataFrame:
+    """Read one specific named sheet from a multi-sheet file."""
+    raw = get_bytes(f)
+    nm  = f.name.lower()
+    if nm.endswith(".xlsb"):
+        try:
+            import pyxlsb
+            return _pick(pd.read_excel(io.BytesIO(raw), engine="pyxlsb",
+                                       sheet_name=sheet_name))
+        except Exception:
+            pass
+    try:
+        df = pd.read_excel(io.BytesIO(raw), engine="openpyxl",
+                           sheet_name=sheet_name)
+        return _pick(df)
+    except Exception:
+        # Fall back to first sheet
+        return read_file(f, sheet_name=0)
+
+
+# ── internal ──────────────────────────────────────────────────────────────────
+
+def _pick(df) -> pd.DataFrame:
+    """If pandas returned a dict (all sheets), return first non-empty one."""
+    if not isinstance(df, dict):
+        return _clean(df)
+    for v in df.values():
+        if not v.empty and len(v) > 1:
+            return _clean(v)
+    return _clean(list(df.values())[0])
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
