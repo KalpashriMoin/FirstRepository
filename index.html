@@ -1332,3 +1332,271 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
+report.py ############################
+
+  """
+report.py — VLDS Excel Output
+Two sheets only:  1. Pivot   2. Final Summary
+NaN/INF safe via nan_inf_to_errors + manual cleaning.
+"""
+
+import io
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _sv(v):
+    """Safe value — convert NaN/inf to empty string for Excel."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+        return ""
+    return v
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in df.columns:
+        if df[c].dtype in (float, "float64", "float32"):
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0)
+        else:
+            try:
+                df[c] = df[c].fillna("")
+            except Exception:
+                pass
+    return df
+
+
+def _w(ws, fmt_map, ri, ci, val, col_name: str, even: bool, money_fmt, pct_fmt,
+       disc_fmt, txt_fmt, alt_fmt):
+    v   = _sv(val)
+    cl  = col_name.lower()
+    is_disc = "discount value" in cl
+    is_pct  = ("discount %" in cl or "growth" in cl) and "value" not in cl
+    is_money = (any(k in cl for k in ("amount", "q4", "increase", "deducted", "sales")) and
+                not is_pct)
+    if is_disc:
+        fmt = disc_fmt
+    elif is_pct:
+        fmt = pct_fmt
+    elif is_money:
+        fmt = money_fmt[even]
+    else:
+        fmt = (txt_fmt if even else alt_fmt)
+    ws.write(ri, ci, v, fmt)
+
+
+# ── Sheet 1: Pivot ────────────────────────────────────────────────────────────
+
+def _write_pivot(writer, pivot_df: pd.DataFrame, quarter: str):
+    wb  = writer.book
+    df  = _clean(pivot_df)
+    ws  = wb.add_worksheet("Pivot")
+    writer.sheets["Pivot"] = ws
+
+    # formats
+    title_f = wb.add_format({"bold": True, "font_size": 13, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "0B1829",
+                              "align": "center", "valign": "vcenter"})
+    h_id    = wb.add_format({"bold": True, "font_size": 10, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "1E4080",
+                              "border": 1, "align": "center", "valign": "vcenter",
+                              "text_wrap": True})
+    h_month = wb.add_format({"bold": True, "font_size": 10, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "276749",
+                              "border": 1, "align": "center"})
+    h_total = wb.add_format({"bold": True, "font_size": 10, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "7B3F00",
+                              "border": 1, "align": "center"})
+    txt_e   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "EBF3FB", "border": 1})
+    txt_o   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFFFFF",  "border": 1})
+    num_e   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "EBF3FB", "border": 1,
+                              "num_format": "#,##0.00"})
+    num_o   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFFFFF",  "border": 1,
+                              "num_format": "#,##0.00"})
+    tot_e   = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFF3CD", "border": 1,
+                              "num_format": "#,##0.00"})
+    tot_o   = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFF9E6", "border": 1,
+                              "num_format": "#,##0.00"})
+    tot_lbl = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 10,
+                              "bg_color": "0B1829", "font_color": "FFFFFF",
+                              "border": 1})
+
+    # title
+    ws.merge_range(0, 0, 0, len(df.columns) - 1,
+                   f"VLDS Pivot — Revenue by Customer × Month  |  {quarter}", title_f)
+    ws.set_row(0, 28)
+
+    id_cols    = [c for c in df.columns if any(k in str(c).lower()
+                  for k in ("customer", "name", "number", "zone", "dealer", "total" ))]
+    id_cols    = [c for c in id_cols if c != "Grand Total"]
+    month_cols = [c for c in df.columns if c not in id_cols and c != "Grand Total"]
+    all_cols   = list(df.columns)
+
+    # header
+    for ci, c in enumerate(all_cols):
+        ws.set_column(ci, ci, max(len(str(c)) + 4, 14))
+        if c == "Grand Total":
+            ws.write(1, ci, c, h_total)
+        elif c in month_cols:
+            ws.write(1, ci, str(c), h_month)
+        else:
+            ws.write(1, ci, str(c), h_id)
+    ws.set_row(1, 24)
+
+    # data
+    last_real = len(df) - 1  # last row is grand total
+    for ri, row in df.iterrows():
+        even = ri % 2 == 0
+        is_total_row = ri == last_real
+        for ci, c in enumerate(all_cols):
+            v = _sv(row[c])
+            if is_total_row:
+                ws.write(ri + 2, ci, v, tot_lbl if c in id_cols else (tot_e if even else tot_o))
+            elif c in month_cols or c == "Grand Total":
+                ws.write(ri + 2, ci, v, num_e if even else num_o)
+            else:
+                ws.write(ri + 2, ci, v, txt_e if even else txt_o)
+
+    ws.freeze_panes(2, 0)
+
+
+# ── Sheet 2: Final Summary ────────────────────────────────────────────────────
+
+def _write_summary(writer, summary_df: pd.DataFrame, quarter: str):
+    wb = writer.book
+    df = _clean(summary_df)
+    ws = wb.add_worksheet("Final Summary")
+    writer.sheets["Final Summary"] = ws
+
+    title_f = wb.add_format({"bold": True, "font_size": 13, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "0B1829",
+                              "align": "center", "valign": "vcenter"})
+    h_id    = wb.add_format({"bold": True, "font_size": 10, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "1E4080",
+                              "border": 1, "align": "center", "text_wrap": True})
+    h_amt   = wb.add_format({"bold": True, "font_size": 10, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "276749",
+                              "border": 1, "align": "center", "text_wrap": True})
+    h_disc  = wb.add_format({"bold": True, "font_size": 10, "font_name": "Calibri",
+                              "font_color": "FFFFFF", "bg_color": "7B3F00",
+                              "border": 1, "align": "center", "text_wrap": True})
+    txt_e   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "EBF3FB", "border": 1})
+    txt_o   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFFFFF",  "border": 1})
+    num_e   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "EBF3FB", "border": 1, "num_format": "#,##0.00"})
+    num_o   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFFFFF",  "border": 1, "num_format": "#,##0.00"})
+    pct_e   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "EBF3FB", "border": 1, "num_format": "0.00"})
+    pct_o   = wb.add_format({"font_name": "Calibri", "font_size": 9,
+                              "bg_color": "FFFFFF",  "border": 1, "num_format": "0.00"})
+    disc_e  = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 9,
+                              "bg_color": "E8F5E9", "border": 1, "num_format": "#,##0.00"})
+    disc_o  = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 9,
+                              "bg_color": "F1FFF4", "border": 1, "num_format": "#,##0.00"})
+    tot_f   = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 10,
+                              "bg_color": "0B1829", "font_color": "FFFFFF",
+                              "border": 1, "num_format": "#,##0.00"})
+    tot_lbl = wb.add_format({"bold": True, "font_name": "Calibri", "font_size": 10,
+                              "bg_color": "0B1829", "font_color": "FFFFFF", "border": 1})
+
+    money_kw = {"amount", "q4", "increase", "deducted", "sales"}
+    disc_kw  = {"discount value"}
+    pct_kw   = {"discount %", "growth"}
+
+    ws.merge_range(0, 0, 0, len(df.columns) - 1,
+                   f"VLDS Final Summary  |  {quarter}  |  "
+                   f"Generated: {datetime.now().strftime('%d %b %Y  %I:%M %p')}", title_f)
+    ws.set_row(0, 28)
+
+    for ci, c in enumerate(df.columns):
+        cl = c.lower()
+        if any(k in cl for k in disc_kw):
+            hf = h_disc
+        elif any(k in cl for k in money_kw) or any(k in cl for k in pct_kw):
+            hf = h_amt
+        else:
+            hf = h_id
+        ws.write(1, ci, c, hf)
+        ws.set_column(ci, ci, max(len(c) + 4, 14))
+    ws.set_row(1, 36)
+
+    last = len(df) - 1
+    for ri, row in df.iterrows():
+        even = ri % 2 == 0
+        is_total = ri == last
+        for ci, c in enumerate(df.columns):
+            v  = _sv(row[c])
+            cl = c.lower()
+            if is_total:
+                fmt = tot_lbl if any(k in cl for k in ("name","number","zone","slab")) else tot_f
+            elif any(k in cl for k in disc_kw):
+                fmt = disc_e if even else disc_o
+            elif any(k in cl for k in pct_kw):
+                fmt = pct_e  if even else pct_o
+            elif any(k in cl for k in money_kw):
+                fmt = num_e  if even else num_o
+            else:
+                fmt = txt_e  if even else txt_o
+            ws.write(ri + 2, ci, v, fmt)
+
+    ws.freeze_panes(2, 2)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def generate_report(pivot_df: pd.DataFrame, summary_df: pd.DataFrame,
+                    quarter: str, mode: str) -> io.BytesIO:
+    label = f"{quarter} · {mode}"
+    buf   = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter",
+                        engine_kwargs={"options": {"nan_inf_to_errors": True}}) as writer:
+        _write_pivot(writer, pivot_df, label)
+        _write_summary(writer, summary_df, label)
+    buf.seek(0)
+    return buf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              
