@@ -1,1 +1,531 @@
 <p>hello world</p>
+
+processor .py
+
+
+"""
+processor.py
+────────────
+VLDS Quarterly Incentive Process — complete business logic.
+
+Exact column names (from client file spec):
+  Main sheet of VLDS Q4-2025:
+    BU, LOB, Sub LOB, Zone, Class, Line Item, Batch Source,
+    Bill to address plus, Channel, Segment, Reporting Fiscal Year,
+    Month (reporting fiscal month), Date, Invoice Number, Invoice Date,
+    Invoice Type, Order Line Subtype Code, Sales Order Number,
+    Revenue Quantity, Revenue Amount, Item, Inventory Item Description,
+    Sales Price Support Amount, Customer Account Name, Customer Account Number,
+    4s Dealer, Org Code (inventory org code), Total Sales, Remarks, BD
+
+  BD column = CONCATENATE(Invoice Number + Item + Revenue Amount)
+              — pre-built by client in Excel, used to match DF/RACD
+
+Process:
+  Step 1 – LOB filter      : remove CBD, Engine, Rebuild, Solutions
+  Step 2 – Exclusion list  : match each particular on its specified column
+                             also match Item No if provided
+  Step 3 – DF/RACD         : BD column value present in DF/RACD file → exclude
+  Step 4 – Eligible        : Remarks column is blank → eligible for VLDS
+  Step 5 – Pivot           : sum Revenue Amount by Customer × Month
+  Step 6 – Final Summary   : join Q4-24, calc Increase, Growth, Discount
+"""
+
+import re
+import pandas as pd
+import numpy as np
+
+
+# ── Column finder (case-insensitive, flexible) ────────────────────────────────
+
+_ALIASES = {
+    "LOB":                      ["lob", "line of business"],
+    "Sub LOB":                  ["sub lob", "sublob", "sub_lob"],
+    "Remarks":                  ["remarks", "remark", "eligibility", "eligibility remarks"],
+    "Invoice Type":             ["invoice type", "invoice_type", "invoicetype", "transaction type"],
+    "Batch Source":             ["batch source", "batch_source", "batchsource"],
+    "Line Item":                ["line item", "line_item", "lineitem"],
+    "Inventory Item Description":["inventory item description", "inventory_item_description",
+                                  "item description", "inv item desc"],
+    "Item":                     ["item", "item no", "item_no", "item number", "part no",
+                                  "material", "material no"],
+    "Revenue Amount":           ["revenue amount", "revenue_amount", "functional amount",
+                                  "amount", "net amount", "sales amount"],
+    "Customer Account Number":  ["customer account number", "customer_account_number",
+                                  "customer number", "cust no", "account number",
+                                  "customer acct no"],
+    "Customer Account Name":    ["customer account name", "customer_account_name",
+                                  "customer name", "dealer name", "account name"],
+    "Invoice Number":           ["invoice number", "invoice_number", "invoice no",
+                                  "doc no", "document number"],
+    "Zone":                     ["zone", "territory", "region"],
+    "Reporting Fiscal Month":   ["month", "reporting fiscal month", "reporting_fiscal_month",
+                                  "cmi month", "fiscal month", "reporting fiscal month name"],
+    "BD":                       ["bd", "concat key", "concat_key", "concatenation key",
+                                  "df key", "dfracd key"],
+    "Customer Number":          ["customer number", "customer no", "customer account number",
+                                  "customer_number"],
+    "Final Amount Q4-24":       ["final amount q4-24", "final amount q4 24", "final_amount_q4_24",
+                                  "eligible sales", "eligible_sales", "final amount"],
+    "4s Dealer":                ["4s dealer", "4s_dealer", "dealer code", "4s"],
+}
+
+
+def col(df: pd.DataFrame, key: str) -> str | None:
+    """Find the actual column name in df for a canonical key. Case-insensitive."""
+    lk = {c.lower().strip(): c for c in df.columns}
+    candidates = _ALIASES.get(key, [key.lower()])
+    for c in candidates:
+        if c.lower() in lk:
+            return lk[c.lower()]
+    return None
+
+
+def safe_num(s) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0)
+
+
+def inr(v) -> str:
+    try:
+        f = float(v)
+        return "₹0.00" if (np.isnan(f) or np.isinf(f)) else f"₹{f:,.2f}"
+    except:
+        return "₹0.00"
+
+
+# ── Step 1: LOB Filter ───────────────────────────────────────────────────────
+
+EXCLUDE_LOB = {"CBD", "ENGINE", "NEW ENGINE", "REBUILD", "SOLUTIONS", "SOLUTION"}
+
+
+def apply_lob_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove rows where LOB ≠ PARTS, and where Remarks already
+    says 'No Other LOB' / 'VLDS Not Applicable'.
+    Marks 'VLDS_Eligible' column as True/False.
+    """
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    lob_col     = col(df, "LOB")
+    remarks_col = col(df, "Remarks")
+
+    df["_eligible"] = True
+    df["_reason"]   = ""
+
+    if lob_col:
+        lob_up = df[lob_col].astype(str).str.strip().str.upper()
+        # Mark non-PARTS LOBs
+        bad_lob = lob_up.isin(EXCLUDE_LOB) | ((lob_up != "PARTS") & (lob_up != ""))
+        df.loc[bad_lob, "_eligible"] = False
+        df.loc[bad_lob & (df["_reason"] == ""), "_reason"] = \
+            "No Other LOB — " + df.loc[bad_lob, lob_col].astype(str)
+
+    if remarks_col:
+        # If Remarks already has "No" indicators from client → ineligible
+        rmk = df[remarks_col].astype(str).str.strip().str.upper()
+        has_no = rmk.str.startswith("NO ") | rmk.isin(["VLDS NOT APPLICABLE", "NA", "NOT APPLICABLE"])
+        df.loc[has_no & df["_eligible"], "_eligible"] = False
+        df.loc[has_no & (df["_reason"] == ""), "_reason"] = \
+            "Remarks: " + df.loc[has_no, remarks_col].astype(str)
+
+    return df
+
+
+# ── Step 2: Exclusion List ───────────────────────────────────────────────────
+
+def apply_exclusion_list(df: pd.DataFrame, excl_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Exclusion list columns: Sr. No. | Particulars | Item No. | Column Name
+    For each row:
+      - Find the target column in df using 'Column Name'
+      - If 'Particulars' found in that column (contains, case-insensitive) → ineligible
+      - If 'Item No.' given (not NA) also check the Item column for exact match
+    """
+    if excl_df.empty:
+        return df
+
+    df = df.copy()
+
+    # Find exclusion list columns
+    part_col = _excl_col(excl_df, ["particulars", "particular", "criteria", "value",
+                                    "description", "line item"])
+    item_col_e = _excl_col(excl_df, ["item no", "item no.", "item_no", "item number",
+                                      "item no (only if applicable otherwise na)",
+                                      "item no (na if not applied)", "item no.(na if not applied)"])
+    col_name_e = _excl_col(excl_df, ["column name", "column on which we check particulars",
+                                      "on which column the particulars are applied",
+                                      "column", "apply to"])
+
+    if part_col is None:
+        # Fallback: use second column
+        part_col = excl_df.columns[1] if len(excl_df.columns) > 1 else excl_df.columns[0]
+
+    for _, row in excl_df.iterrows():
+        particular = str(row.get(part_col, "")).strip()
+        if not particular or particular.upper() in ("NAN", "NONE", "", "N/A", "NA", "-", "SR. NO."):
+            continue
+
+        item_no_val = str(row.get(item_col_e, "NA")).strip() if item_col_e else "NA"
+        col_name_val = str(row.get(col_name_e, "")).strip() if col_name_e else ""
+
+        # Determine target column in main df
+        target = _resolve_col(df, col_name_val)
+
+        # Apply particular match on target column
+        if target:
+            s = df[target].astype(str).str.upper()
+            mask = s.str.contains(particular.upper(), na=False, regex=False)
+            df.loc[mask & df["_eligible"], "_eligible"] = False
+            df.loc[mask & (df["_reason"] == ""), "_reason"] = f"Excl List: {particular}"
+
+        # Also check Item column if Item No provided
+        if item_no_val.upper() not in ("NA", "N/A", "NAN", "NONE", "", "-"):
+            item_col_df = col(df, "Item")
+            if item_col_df:
+                s_item = df[item_col_df].astype(str).str.strip().str.upper()
+                mask_item = (s_item == item_no_val.upper()) | \
+                             s_item.str.startswith(item_no_val.upper())
+                df.loc[mask_item & df["_eligible"], "_eligible"] = False
+                df.loc[mask_item & (df["_reason"] == ""), "_reason"] = \
+                    f"Excl List: {particular} (Item No: {item_no_val})"
+
+    return df
+
+
+def _excl_col(df: pd.DataFrame, candidates: list) -> str | None:
+    lk = {c.lower().strip(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in lk:
+            return lk[c.lower()]
+    return None
+
+
+def _resolve_col(df: pd.DataFrame, col_name_str: str) -> str | None:
+    """Map exclusion list 'Column Name' value → actual df column."""
+    if not col_name_str or col_name_str.upper() in ("NAN", "NONE", "", "-"):
+        return col(df, "Line Item") or col(df, "Inventory Item Description")
+    # Direct lookup first
+    lk = {c.lower().strip(): c for c in df.columns}
+    if col_name_str.lower() in lk:
+        return lk[col_name_str.lower()]
+    # Try canonical alias lookup
+    found = col(df, col_name_str)
+    if found:
+        return found
+    # Partial match
+    for c in df.columns:
+        if col_name_str.lower() in c.lower():
+            return c
+    return col(df, "Line Item")
+
+
+# ── Step 3: DF/RACD Exclusion ────────────────────────────────────────────────
+
+def apply_dfracd(df: pd.DataFrame, dfracd_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build concat key: Invoice Number + "|" + Item + "|" + Revenue Amount
+    Compare against:
+      a) BD column in main df (pre-built by client)
+      b) Same concat key built from DF/RACD file columns
+    Rows where Remarks = 'No DF/RACD' or where key matches → ineligible.
+    """
+    df = df.copy()
+
+    # Check BD column (pre-built concat key from client's Excel formula)
+    bd_col      = col(df, "BD")
+    remarks_col = col(df, "Remarks")
+
+    # Build concat keys from DF/RACD file
+    dfracd_keys = _build_dfracd_keys(dfracd_df)
+
+    # Method A: match BD column against DF/RACD keys
+    if bd_col and dfracd_keys:
+        bd_vals = df[bd_col].astype(str).str.strip()
+        mask_bd = bd_vals.isin(dfracd_keys)
+        df.loc[mask_bd & df["_eligible"], "_eligible"] = False
+        df.loc[mask_bd & (df["_reason"] == ""), "_reason"] = "DF/RACD Exclusion (BD key match)"
+
+    # Method B: build our own concat key and match
+    inv_col = col(df, "Invoice Number")
+    itm_col = col(df, "Item")
+    amt_col = col(df, "Revenue Amount")
+    if inv_col and itm_col and amt_col and dfracd_keys:
+        our_key = (
+            df[inv_col].astype(str).str.strip() + "|" +
+            df[itm_col].astype(str).str.strip() + "|" +
+            safe_num(df[amt_col]).astype(str)
+        )
+        mask_own = our_key.isin(dfracd_keys)
+        df.loc[mask_own & df["_eligible"], "_eligible"] = False
+        df.loc[mask_own & (df["_reason"] == ""), "_reason"] = "DF/RACD Exclusion (key match)"
+
+    # Method C: Remarks column says "No DF" / "No RACD" / "No DF/RACD"
+    if remarks_col:
+        rmk = df[remarks_col].astype(str).str.strip().str.upper()
+        mask_rmk = rmk.str.contains(r"NO\s*DF|NO\s*RACD|DF.*RACD", na=False, regex=True)
+        df.loc[mask_rmk & df["_eligible"], "_eligible"] = False
+        df.loc[mask_rmk & (df["_reason"] == ""), "_reason"] = "DF/RACD — Remarks flag"
+
+    return df
+
+
+def _build_dfracd_keys(dfracd_df: pd.DataFrame) -> set:
+    """Build set of concat keys from the DF/RACD file."""
+    if dfracd_df.empty:
+        return set()
+
+    keys = set()
+
+    # Look for a pre-built concat/key column
+    for c in dfracd_df.columns:
+        if c.lower().strip() in ("bd", "concat key", "concat_key", "key",
+                                  "concatenation key", "dfracd key", "unique key"):
+            keys |= set(dfracd_df[c].astype(str).str.strip().tolist())
+            break
+
+    # Build our own key from columns
+    inv = col(dfracd_df, "Invoice Number")
+    itm = col(dfracd_df, "Item")
+    amt = col(dfracd_df, "Revenue Amount")
+    if inv and itm and amt:
+        built = (
+            dfracd_df[inv].astype(str).str.strip() + "|" +
+            dfracd_df[itm].astype(str).str.strip() + "|" +
+            safe_num(dfracd_df[amt]).astype(str)
+        )
+        keys |= set(built.tolist())
+    elif inv:
+        keys |= set(dfracd_df[inv].astype(str).str.strip().tolist())
+
+    keys.discard("nan"); keys.discard(""); keys.discard("nan|nan|0.0")
+    return keys
+
+
+# ── Step 4: Split eligible / excluded ────────────────────────────────────────
+
+def split_eligible(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (eligible_df, excluded_df) based on _eligible column."""
+    eligible = df[df["_eligible"] == True].copy()
+    excluded = df[df["_eligible"] == False].copy()
+    return eligible, excluded
+
+
+# ── Step 5: Build Pivot ───────────────────────────────────────────────────────
+
+def build_pivot(eligible_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot: sum of Revenue Amount
+    Rows:  Customer Account Name, Customer Account Number
+    Cols:  Reporting Fiscal Month (e.g. 2025/10, 2025/11, 2025/12)
+    + Grand Total column and row
+    """
+    df = eligible_df.copy()
+
+    cust_no  = col(df, "Customer Account Number")
+    cust_nm  = col(df, "Customer Account Name")
+    month_c  = col(df, "Reporting Fiscal Month")
+    amt_c    = col(df, "Revenue Amount")
+    zone_c   = col(df, "Zone")
+
+    if not cust_no or not amt_c:
+        return pd.DataFrame()
+
+    df[amt_c] = safe_num(df[amt_c])
+
+    id_cols = [c for c in [cust_no, cust_nm, zone_c] if c]
+
+    if month_c:
+        pivot = df.pivot_table(
+            index=id_cols,
+            columns=month_c,
+            values=amt_c,
+            aggfunc="sum",
+            fill_value=0,
+        ).reset_index()
+        pivot.columns.name = None
+        month_cols = [c for c in pivot.columns if c not in id_cols]
+        # Sort month columns
+        try:
+            month_cols_sorted = sorted(month_cols, key=lambda x: str(x))
+        except Exception:
+            month_cols_sorted = month_cols
+        pivot["Grand Total"] = pivot[month_cols_sorted].sum(axis=1)
+        col_order = id_cols + month_cols_sorted + ["Grand Total"]
+        pivot = pivot[col_order]
+    else:
+        pivot = df.groupby(id_cols, dropna=False)[amt_c].sum().reset_index()
+        pivot = pivot.rename(columns={amt_c: "Grand Total"})
+
+    pivot = pivot.sort_values("Grand Total", ascending=False).reset_index(drop=True)
+
+    # Grand Total row at bottom
+    total_row = {}
+    for c in pivot.columns:
+        if c in id_cols:
+            total_row[c] = "GRAND TOTAL" if c == id_cols[0] else ""
+        else:
+            try:
+                total_row[c] = pd.to_numeric(pivot[c], errors="coerce").sum()
+            except Exception:
+                total_row[c] = ""
+    pivot = pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
+
+    return pivot
+
+
+# ── Step 6: Final Summary ─────────────────────────────────────────────────────
+
+def build_final_summary(
+    eligible_df:    pd.DataFrame,
+    excluded_df:    pd.DataFrame,
+    prev_df:        pd.DataFrame,
+    slab_df:        pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Output columns (exact match to client's Final Summary):
+      Customer Name | Zone | Customer Number |
+      Final Amount Q4-25 | Q4-24 | Deducted as per Exclusion List |
+      Final Amount Q4-24 | Increase | Growth | Discount % | Discount Value
+    """
+    el   = eligible_df.copy()
+    excl = excluded_df.copy()
+    prev = prev_df.copy()
+
+    cust_no_e = col(el, "Customer Account Number")
+    cust_nm_e = col(el, "Customer Account Name")
+    amt_e     = col(el, "Revenue Amount")
+    zone_e    = col(el, "Zone")
+
+    if not cust_no_e or not amt_e:
+        return pd.DataFrame()
+
+    el[amt_e] = safe_num(el[amt_e])
+    el[cust_no_e] = el[cust_no_e].astype(str).str.strip()
+
+    # ── Current quarter eligible sales per dealer ──────────────────────────
+    agg = {amt_e: "sum"}
+    if cust_nm_e: agg[cust_nm_e] = "first"
+    if zone_e:    agg[zone_e]    = "first"
+    curr = el.groupby(cust_no_e).agg(agg).reset_index()
+    curr = curr.rename(columns={
+        cust_no_e:  "Customer Number",
+        amt_e:      "Final Amount Q4-25",
+        **(  {cust_nm_e: "Customer Name"} if cust_nm_e else {}),
+        **(  {zone_e:    "Zone"}          if zone_e    else {}),
+    })
+
+    # ── Deducted as per Exclusion List ─────────────────────────────────────
+    #    Sum of excluded records (not DF/RACD) per dealer — absolute value
+    cust_no_x = col(excl, "Customer Account Number")
+    amt_x     = col(excl, "Revenue Amount")
+    deducted  = pd.Series(dtype=float)
+
+    if cust_no_x and amt_x and not excl.empty:
+        excl[amt_x]    = safe_num(excl[amt_x])
+        excl[cust_no_x] = excl[cust_no_x].astype(str).str.strip()
+        # Only exclusion-list exclusions (not DF/RACD)
+        reason_c = "_reason"
+        if reason_c in excl.columns:
+            excl_list_only = excl[~excl[reason_c].str.contains("DF/RACD", na=False)]
+        else:
+            excl_list_only = excl
+        deducted = excl_list_only.groupby(cust_no_x)[amt_x].sum().abs()
+        deducted.index = deducted.index.astype(str)
+
+    curr["Customer Number"] = curr["Customer Number"].astype(str)
+    curr["Deducted as per Exclusion List"] = curr["Customer Number"].map(deducted).fillna(0)
+
+    # ── Q4-24 data ─────────────────────────────────────────────────────────
+    cust_no_p = col(prev, "Customer Number")
+    if cust_no_p is None:
+        cust_no_p = col(prev, "Customer Account Number")
+    amt_p = col(prev, "Final Amount Q4-24")
+
+    if cust_no_p and amt_p and not prev.empty:
+        prev[amt_p]     = safe_num(prev[amt_p])
+        prev[cust_no_p] = prev[cust_no_p].astype(str).str.strip()
+        prev_map = prev.set_index(cust_no_p)[amt_p].to_dict()
+        curr["Q4-24"]             = curr["Customer Number"].map(prev_map).fillna(0)
+        curr["Final Amount Q4-24"] = curr["Q4-24"]
+    else:
+        curr["Q4-24"]             = 0
+        curr["Final Amount Q4-24"] = 0
+
+    # ── Growth formulas (from SOP) ─────────────────────────────────────────
+    # Increase = Current Quarter - Previous Year Quarter
+    curr["Increase"] = curr["Final Amount Q4-25"] - curr["Final Amount Q4-24"]
+
+    # Growth = Increase / Previous Year Quarter Sale
+    curr["Growth"] = curr.apply(
+        lambda r: round(r["Increase"] / r["Final Amount Q4-24"], 6)
+                  if r["Final Amount Q4-24"] != 0 else None,
+        axis=1,
+    )
+
+    # ── VLDS Slab ──────────────────────────────────────────────────────────
+    def get_slab(g):
+        if g is None or (isinstance(g, float) and (np.isnan(g) or np.isinf(g))):
+            return 0.0, "N/A — No Q4-24 Data"
+        g_pct = g * 100  # Growth is stored as ratio; slab table uses %
+        for _, r in slab_df.iterrows():
+            lo = float(r.get("Growth_From_%", 0))
+            hi = float(r.get("Growth_To_%", 9999))
+            if lo <= g_pct < hi:
+                return float(r.get("Incentive_%", 0)), str(r.get("Slab", ""))
+        return 0.0, "Below Minimum Threshold"
+
+    curr[["Discount_%_num", "Slab Applied"]] = curr["Growth"].apply(
+        lambda g: pd.Series(get_slab(g))
+    )
+    curr["Discount %"]    = curr["Discount_%_num"]
+    # Discount Value = Current Quarter × Discount %
+    curr["Discount Value"] = (curr["Final Amount Q4-25"] * curr["Discount %"] / 100).round(2)
+    curr.drop(columns=["Discount_%_num"], inplace=True, errors="ignore")
+
+    # ── Column order (exact client spec) ──────────────────────────────────
+    order = ["Customer Name", "Zone", "Customer Number",
+             "Final Amount Q4-25", "Q4-24",
+             "Deducted as per Exclusion List",
+             "Final Amount Q4-24", "Increase", "Growth",
+             "Discount %", "Slab Applied", "Discount Value"]
+    order = [c for c in order if c in curr.columns]
+    out = curr[order].sort_values("Final Amount Q4-25", ascending=False)
+
+    # ── Totals row ─────────────────────────────────────────────────────────
+    total = {}
+    money_kw = {"final amount", "q4", "deducted", "increase", "discount value"}
+    for c in out.columns:
+        cl = c.lower()
+        if any(k in cl for k in money_kw):
+            try:
+                total[c] = pd.to_numeric(out[c], errors="coerce").sum()
+            except Exception:
+                total[c] = ""
+        elif c in ("Customer Name", "Customer Number"):
+            total[c] = "TOTAL"
+        else:
+            total[c] = ""
+    out = pd.concat([out, pd.DataFrame([total])], ignore_index=True)
+
+    return out.reset_index(drop=True)
+
+
+# ── Default Slab Tables ───────────────────────────────────────────────────────
+
+DEFAULT_QUARTERLY_SLABS = pd.DataFrame([
+    {"Slab": "Slab 1", "Growth_From_%": 20.0,  "Growth_To_%": 22.0,  "Incentive_%": 0.50},
+    {"Slab": "Slab 2", "Growth_From_%": 22.0,  "Growth_To_%": 24.0,  "Incentive_%": 0.75},
+    {"Slab": "Slab 3", "Growth_From_%": 24.0,  "Growth_To_%": 26.0,  "Incentive_%": 1.00},
+    {"Slab": "Slab 4", "Growth_From_%": 26.0,  "Growth_To_%": 28.0,  "Incentive_%": 1.25},
+    {"Slab": "Slab 5", "Growth_From_%": 28.0,  "Growth_To_%": 30.0,  "Incentive_%": 1.50},
+    {"Slab": "Slab 6", "Growth_From_%": 30.0,  "Growth_To_%": 9999., "Incentive_%": 1.75},
+])
+
+DEFAULT_ANNUAL_SLABS = pd.DataFrame([
+    {"Slab": "Slab 1", "Growth_From_%": 21.0,  "Growth_To_%": 22.0,  "Incentive_%": 0.50},
+    {"Slab": "Slab 2", "Growth_From_%": 22.0,  "Growth_To_%": 23.0,  "Incentive_%": 0.80},
+    {"Slab": "Slab 3", "Growth_From_%": 23.0,  "Growth_To_%": 24.0,  "Incentive_%": 1.25},
+    {"Slab": "Slab 4", "Growth_From_%": 24.0,  "Growth_To_%": 26.0,  "Incentive_%": 1.50},
+    {"Slab": "Slab 5", "Growth_From_%": 26.0,  "Growth_To_%": 9999., "Incentive_%": 1.75},
+])
