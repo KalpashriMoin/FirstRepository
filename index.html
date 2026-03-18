@@ -539,3 +539,133 @@ st.markdown("""
 VLDS Process · 4S Dealerships · Forest Dealerships · Confidential
 </div>""", unsafe_allow_html=True)
 
+
+
+"""
+reader.py — Fast, bulletproof file reader.
+
+Root cause of upload errors: Streamlit UploadedFile is a lazy stream.
+Fix: always f.read() → bytes → BytesIO → pandas. Never pass f directly.
+"""
+import io
+import pandas as pd
+
+
+def _raw(f) -> bytes:
+    f.seek(0)
+    return f.read()
+
+
+def sheet_names(f) -> list:
+    raw = _raw(f)
+    nm  = f.name.lower()
+    if nm.endswith(".xlsb"):
+        try:
+            import pyxlsb
+            with pyxlsb.open_workbook(io.BytesIO(raw)) as wb:
+                return list(wb.sheets)
+        except Exception:
+            return []
+    try:
+        return pd.ExcelFile(io.BytesIO(raw), engine="openpyxl").sheet_names
+    except Exception:
+        return []
+
+
+def read_df(f, sheet=0) -> pd.DataFrame:
+    """
+    Read any uploaded Excel/CSV into a clean DataFrame.
+    sheet: int index or str sheet name.
+    Raises IOError with plain-English message if all engines fail.
+    """
+    raw = _raw(f)
+    nm  = f.name.lower()
+    errs = []
+
+    if nm.endswith(".csv"):
+        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+            try:
+                df = pd.read_csv(io.BytesIO(raw), encoding=enc,
+                                 on_bad_lines="skip", low_memory=False)
+                return _clean(df)
+            except Exception as e:
+                errs.append(str(e))
+        raise IOError("Cannot read CSV: " + " | ".join(errs))
+
+    if nm.endswith(".xlsb"):
+        try:
+            import pyxlsb
+            df = pd.read_excel(io.BytesIO(raw), engine="pyxlsb", sheet_name=sheet)
+            return _clean(_pick(df))
+        except Exception as e:
+            raise IOError(
+                f"Cannot read .xlsb: {e}\n"
+                "Fix → Open in Excel → Save As → Excel Workbook (.xlsx) → re-upload."
+            )
+
+    # xlsx / xls
+    engines = ["openpyxl"] + (["xlrd"] if nm.endswith(".xls") else [])
+    for eng in engines:
+        try:
+            df = pd.read_excel(io.BytesIO(raw), engine=eng, sheet_name=sheet)
+            return _clean(_pick(df))
+        except Exception as e:
+            errs.append(f"{eng}: {e}")
+
+    raise IOError(
+        "Cannot open this file.\n\n"
+        "Please try:\n"
+        "1. Close the file in Excel first, then re-upload\n"
+        "2. Excel → File → Save As → Excel Workbook (.xlsx) → re-upload\n"
+        "3. Remove any password protection\n\n"
+        f"Detail: {' | '.join(errs[-2:])}"
+    )
+
+
+def _pick(df):
+    if not isinstance(df, dict):
+        return df
+    for v in df.values():
+        if not v.empty and len(v) > 0:
+            return v
+    return list(df.values())[0]
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
