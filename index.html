@@ -1,1 +1,1252 @@
 
+1.1 Project Overview
+The Volume Link Discount Scheme (VLDS) Automation System is a standalone desktop application developed for Forest Dealerships to fully automate the quarterly incentive processing pipeline. The system replaces a manual, error-prone, three-to-five working day Excel-based process with an automated tool that delivers the complete incentive report in under fifteen minutes with zero manual calculation.
+
+The application is built using Python 3.10 with a Tkinter graphical user interface. It accepts multiple input Excel files, processes them through a nine-step business logic pipeline, and produces a professionally formatted three-sheet Microsoft Excel report with embedded live Excel formulas. A complete text-format audit log is generated with every run, recording every processing decision for traceability and dispute resolution.
+
+A key innovation of this system is the live Excel formula output. Rather than writing static calculated values, the application embeds Excel formulas for Increase, Growth Percentage, Discount Percentage (as a nested IF formula derived from the slab table), and Discount Value. This allows the Finance team to modify values such as previous year sales figures directly in the output Excel file and observe all dependent columns recalculate automatically without re-running the application.
+
+1.2 Business Need and Problem Statement
+Prior to this system, the Finance team processed VLDS incentive data entirely by hand using Microsoft Excel. This manual process required two to three analysts working for three to five working days per quarter. The following systematic deficiencies were identified:
+
+Problem
+Root Cause
+Business Impact
+Severity
+
+Exclusion list applied inconsistently
+Subjective analyst interpretation of exclusion criteria
+Wrong dealers included in payout calculations
+Critical
+
+Previous year VLOOKUP failures
+Dealer code format differences between file years (12345 vs 12345.0)
+Growth percentage wrong for multiple dealers each quarter
+Critical
+
+Manual slab lookup errors
+Row-by-row incentive rate lookup for hundreds of dealers
+Incorrect incentive amounts calculated and disbursed
+Critical
+
+No audit trail
+No systematic recording of processing decisions
+Dealer disputes cannot be resolved; internal audit unsatisfied
+High
+
+No input file validation
+No verification that the correct file is loaded for each step
+Outdated or wrong files processed without detection
+High
+
+Processing takes 3–5 working days
+Entirely manual multi-step process
+Delayed disbursements and analyst overtime
+High
+
+Inconsistent report format
+Layout varies by analyst and quarter
+Management cannot make cross-quarter comparisons
+Medium
+
+No progress visibility
+Processing status unknown until completed
+Repeated status queries to team
+Low
+
+
+1.3 Project Objectives
+Automate all nine steps of the VLDS incentive processing pipeline, eliminating all manual calculation, filtering, and lookup operations.
+Reduce quarterly processing time from three to five working days to under fifteen minutes.
+Deliver a fully dynamic system — all business rules (exclusion criteria, slab rates, dealer lists) are read from uploaded files at runtime with zero code changes required between quarters.
+Generate a standardised three-sheet Excel report with live Excel formulas enabling post-generation corrections without re-running the application.
+Provide a complete downloadable audit log for every processing run, including per-item exclusion audit with revenue impact, to support dealer dispute resolution and internal audit requirements.
+Deploy as a standalone Windows executable requiring no Python installation on client machines.
+Implement customer name deduplication by Customer Number to prevent duplicate rows in the incentive summary when dealers are renamed across quarters.
+
+
+2. Scope and Key Functionalities
+
+2.1 In Scope
+Quarterly VLDS incentive processing for Q1 through Q4 for any year from 2022 to 2032.
+Support for both Quarterly and Annual payout type modes, with slab column selection driven by user input.
+Acceptance of five input files through a file picker interface: VLDS Main File, DF & RECD File, Previous Year Summary, Combined Reference File (3 sheets: Dealer List, Exclusion List, Slab Table), and optional Base Data.
+Nine-step processing pipeline: data loading, 4S dealer filtering, LOB eligibility filtering, exclusion list application with per-item audit, DF-RECD matching, eligible/excluded split, quarterly pivot generation, previous year comparison with growth and incentive calculation, and Excel output generation.
+Dynamic exclusion list processing with four-column support: SR.NO, Particulars/Line Item, Item Name, Column where filter applied.
+Customer name deduplication — stripping parenthetical aliases like '(formerly known as ...)' and consolidating by Customer Number.
+Three-sheet Excel output with live formulas: Quarterly Pivot, Final Summary, Eligible Data review sheet.
+Nested IF Excel formula for Discount Percentage derived dynamically from the uploaded slab table brackets.
+Detailed exclusion audit log showing matched items, unmatched items, and revenue impact per exclusion rule.
+Text-format audit log downloadable with every run.
+Delivery as a standalone Windows .exe via PyInstaller.
+
+2.2 Out of Scope
+Web-based or cloud deployment.
+Direct integration with ERP or sales management database — data is provided as exported Excel files.
+Multi-user concurrent processing.
+Automated email distribution of generated reports.
+Annual summary aggregating all four quarters.
+macOS or Linux deployment.
+
+2.3 Key Functionalities
+Feature
+Module
+Description
+
+Dynamic file parsing
+utils.py
+Reads any input file regardless of column naming — keyword detection with positional fallback
+
+Combined Reference File
+utils.py
+Single Excel workbook with 3 sheets (Dealer, Exclusion, Slab) — detected by keyword or position
+
+4S Dealer eligibility
+processor.py Step 2
+Inner join with dealer list after normalising dealer codes (strips .0 suffix)
+
+LOB eligibility filter
+processor.py Step 3
+Retains only PARTS and HIGHWAY rows — case-insensitive match
+
+Dynamic exclusion list
+processor.py Step 4
+Four-column format: Particulars searched in target column; Item Name searched in Item column; Column where filter applied determines target
+
+Exclusion audit report
+processor.py Step 4
+Per-item log: matched/unmatched items, rows flagged, revenue impact per rule
+
+DF-RECD BD key matching
+processor.py Step 5
+Composite key construction with normalisation for format-safe matching
+
+Customer name deduplication
+processor.py Step 7
+Strips (formerly known as ...) text; consolidates by Customer Number before pivot
+
+Quarterly pivot
+processor.py Step 7
+pandas pivot_table by Customer Name + Number across fiscal months with Grand Total
+
+Previous year merge
+processor.py Step 8
+LEFT JOIN with normalised code matching — division-by-zero protection for Growth %
+
+Nested IF formula
+processor.py Step 8
+_build_disc_formula() creates live Excel formula from slab brackets at runtime
+
+Three-sheet Excel output
+processor.py Step 9
+Quarterly Pivot, Final Summary with live formulas, Eligible Data with AutoFilter
+
+File validation
+app_tk.py
+Filename keyword scoring warns if wrong file uploaded to wrong slot
+
+Background processing
+app_tk.py
+Worker thread with Queue for thread-safe UI updates — UI never freezes
+
+Previous year auto-detect
+app_tk.py
+Detects Customer ID and Sales Amount columns from Previous Year file by keyword
+
+
+
+3. Detailed Process Flow Architecture
+
+3.1 System Architecture
+The system follows a three-layer architecture that separates presentation, data access, and business logic into independent modules. Changes to the UI do not affect processing logic, and changes to business rules do not require UI modifications.
+
+  PRESENTATION LAYER — app_tk.py (Tkinter Desktop UI)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  File Pickers  │  Settings Panel  │  Progress Bar  │  Downloads  │
+  │  (Browse / X)  │  (Q/Y/Payout)    │  (9-step)      │  (xlsx/txt) │
+  └──────────────────────────┬─────────────────────────────────────┘
+                             │ file paths + parameters + callbacks
+  DATA ACCESS LAYER — utils.py
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  parse_excl()  │  parse_slab()  │  read_file()  │  _load_combined()  │
+  │  (Exclusion)    (Slab brackets)  (Any Excel/CSV)  (3-sheet split)    │
+  └──────────────────────────┬─────────────────────────────────────┘
+                             │ standardised Pandas DataFrames
+  BUSINESS LOGIC LAYER — processor.py (VLDSProcessor class)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  step1_load → step2_dealer → step3_lob → step4_exclusions →      │
+  │  step5_dfrecd → step6_split → step7_pivot → step8_summary →      │
+  │  step9_excel_output                                               │
+  │  (Returns: xlsx bytes + audit log + processing stats)             │
+  └──────────────────────────────────────────────────────────────────┘
+
+
+3.2 Module Descriptions
+Module
+File
+Lines
+Primary Responsibility
+Key Functions
+
+Presentation
+app_tk.py
+~600
+Tkinter desktop UI — file management, settings, progress, download
+VLDSApp, _browse(), _clear(), _detect_prev(), _worker(), _poll_queue(), _save_report(), _save_log()
+
+Data Access
+utils.py
+~400
+Dynamic file parsing — handles any column naming or slab format
+parse_excl(), parse_slab(), read_file(), _load_combined()
+
+Business Logic
+processor.py
+~1150
+Nine-step pipeline — filtering, calculation, formula generation, Excel output
+VLDSProcessor, step1–step9, _apply_slab_to_series(), _build_disc_formula()
+
+Configuration
+config.py
+~50
+Application constants and defaults
+APP_VERSION, settings
+
+
+3.3 Nine-Step Processing Pipeline — Detailed
+Step
+Function
+Input
+Processing Logic
+Output / Effect
+
+1
+step1_load()
+VLDS Main File
+Read Excel/CSV using pandas; auto-detect revenue column by keyword scanning (revenue, sales, net, amount); auto-detect fiscal month column; detect quarter and year from filename pattern
+Full raw DataFrame loaded; stats.total set; quarter and year recorded in stats
+
+2
+step2_dealer_filter()
+Step 1 df + 4S Dealer List (from Combined File Sheet 1)
+Normalise dealer codes on both sides — strip .0 decimal suffix from float-formatted codes; perform inner join to retain only dealers present in the 4S list
+Non-4S rows removed; count logged; normalisation handles 12345.0 vs 12345
+
+3
+step3_lob_filter()
+Step 2 df
+Case-insensitive string comparison: retain rows where LOB column value equals PARTS or HIGHWAY; all other LOB categories removed
+Non-eligible LOB rows removed; count logged
+
+4
+step4_exclusions()
+Step 3 df + Exclusion List (from Combined File Sheet 2)
+Four-column exclusion processing: For each exclusion row — if Item Name is NA, search Particulars value in the column specified by Column where filter applied; if Item Name has a value, search Item Name in Item column AND Particulars in Line Item column. Remark set to 'Exclusion List - [Particulars value]'. Full per-item audit with revenue impact generated.
+Excluded rows flagged with remark; detailed audit report in log showing matched items, unmatched items, and revenue impact per rule
+
+5
+step5_dfrecd()
+Step 4 df + DF-RECD File
+Construct BD composite key from multiple identifying columns in both files; normalise keys; remove rows where BD key matches between files
+RECD-matched rows removed; count logged
+
+6
+step6_split()
+Step 5 df
+Add Remark column — eligible rows get empty remark; store full dataset (all rows with all remarks) in self._full_df for the Eligible Data review sheet
+df_eligible (for pivot) + df_full (for Sheet 3); hero stat = eligible revenue sum
+
+7
+step7_pivot()
+df_eligible
+Customer name deduplication: strip (formerly known as ...) text using regex; map all rows for same Customer Number to the cleaned name. Then pivot_table on Customer Name + Customer Number; columns = fiscal months; values = revenue; fill NaN with (blank); add Grand Total column; verify pivot total matches Step 6 total
+df_pivot: one row per unique dealer with monthly sales and Grand Total; dedup count logged
+
+8
+step8_summary()
+df_pivot + Previous Year file + Slab DataFrame
+Auto-detect prev year Customer ID and Amount columns by keyword; normalise codes; LEFT JOIN; calculate Increase = Q-curr minus Q-prev; Growth % = IF(Q-prev=0, 0, Increase/Q-prev*100); slab lookup for Discount %; build nested IF formula from slab brackets; Discount Value = Q-curr * Disc% / 100
+df_summary: one row per dealer with all incentive columns; nested IF formula string generated
+
+9
+step9_excel_output()
+df_pivot + df_summary + df_full
+Write three-sheet xlsx using xlsxwriter: Sheet 1 Quarterly Pivot with formatting; Sheet 2 Final Summary with live write_formula() for Increase, Growth%, nested IF for Disc%, Disc Value; Sheet 3 Eligible Data with AutoFilter and renamed Exclusion List column; Grand Total rows with SUM/SUMPRODUCT formulas
+xlsx bytes returned in BytesIO buffer for download
+
+
+
+3.4 Exclusion List Processing — Detailed Logic
+The exclusion list is the most complex filtering step. It uses a four-column format uploaded in the Combined Reference File Sheet 2:
+
+Column
+Content
+Role in Processing
+
+SR.NO
+Serial number
+Reference only — not used in processing logic
+
+Particulars/Line Item
+The text value to search for in the VLDS data
+Searched in the target column determined by 'Column where filter applied'
+
+Item Name
+The item code to match; NA means not applicable
+If not NA: searched in the Item column of VLDS data. If NA: ignored — only Particulars is used
+
+Column where filter applied
+Specifies which VLDS column to search the Particulars value in
+Mapped to VLDS columns: 'Invoice type/Transaction type' → invoice column; 'Line Item' → line item column; 'Batch' → batch source column
+
+
+Exclusion Decision Logic
+  FOR EACH ROW in Exclusion List:
+
+    IF Item_Name is 'NA' or 'N/A' or blank:
+      → Read 'Column where filter applied' to determine target column
+      → Search 'Particulars' value in that target column of VLDS data
+      → Example: Particulars='CSS EDO PARTS', Column='Invoice type'
+        → Search 'CSS EDO PARTS' in the Invoice Type column
+
+    ELSE (Item_Name has a real value like 'A0753RG'):
+      → Search 'Item_Name' in the Item column of VLDS data
+      → ALSO search 'Particulars' in the Line Item column
+      → Example: Particulars='SYSTEM,AFTERTREATMENT', Item='A0753RG'
+        → Search 'A0753RG' in Item column
+        → ALSO search 'SYSTEM,AFTERTREATMENT' in Line Item column
+        → Either match flags the row
+
+    IF rows matched AND not already flagged:
+      → Set Remark = 'Exclusion List - [Particulars value]'
+      → Log: item name, rows found, revenue impact
+
+    IF no rows matched:
+      → Log as UNMATCHED ITEM (warning) — may indicate spelling mismatch
+
+
+Exclusion Audit Report (in Download Log)
+After processing all exclusion rules, the system generates a detailed audit section in the downloadable log file. This section contains:
+Total exclusion rules processed vs rules that matched vs rules that found no rows.
+For each MATCHED rule: serial number, Particulars text, Item Name, which column was searched, how many rows were found, how many were newly flagged (vs already flagged by a prior rule), and the revenue impact in Crores.
+For each UNMATCHED rule: serial number, Particulars text, Item Name, which column was searched — flagged as a warning so the user can verify if the item exists in the data with different spelling.
+Revenue summary: total revenue before exclusion, total revenue excluded, total revenue after exclusion.
+
+  ═══ EXCLUSION AUDIT REPORT ═══
+  Total exclusion rules: 523
+  Rules that MATCHED data: 187
+  Rules that found NO rows: 336
+  Total rows newly flagged: 4,250
+
+  ── MATCHED ITEMS (187) ──
+  ✓ SR#  1 | CSS EDO PARTS               | Item: NA     | Found:  320 | Rev: ₹12.45 Cr
+  ✓ SR#  2 | SYSTEM,AFTERTREATMENT        | Item: A0753RG| Found:   45 | Rev: ₹ 3.21 Cr
+  ...
+
+  ── UNMATCHED ITEMS (336) ──
+  ✗ SR# 15 | OLD PRODUCT XYZ              | Item: X9999  | Search: in [Line Item]
+  ...
+
+  ── REVENUE IMPACT ──
+  Revenue BEFORE exclusion: ₹456.78 Cr
+  Revenue EXCLUDED:         ₹ 87.32 Cr
+  Revenue AFTER exclusion:  ₹369.46 Cr
+
+
+
+3.5 Slab Table Processing and Formula Generation
+Phase 1 — File Parsing (parse_slab in utils.py)
+The slab file is read with header=None — no assumptions about row structure. Every row is scanned. The first numeric value in each cell is extracted using Python regex (re.findall). Header rows containing text like 'Quarterly', 'Growth %', 'Incentive Payout' are silently skipped because their cells produce no numeric values.
+
+Cell Content in Slab File
+Extracted Value
+Extraction Method
+
+'20% to 22%'
+20.0
+Regex finds first number: 20
+
+'Above 30%'
+30.0
+Strips text prefix, extracts number
+
+'0-10%'
+0.0
+Takes lower bound of range
+
+'2.0%' or '2.0'
+2.0
+Plain decimal extraction
+
+0.02 (stored as decimal fraction)
+2.0
+Detected as < 0.10, multiplied by 100
+
+30 (plain integer)
+30.0
+Direct float conversion
+
+
+Phase 2 — Bracket Construction
+Parsed rows are sorted by growth lower bound ascending. The upper bound of each bracket = next row's lower bound. The final row gets upper bound 999999 — ensuring all growth values above the last threshold (e.g., 400%) are captured by the last bracket and return its payout rate.
+
+Growth Min (%)
+Growth Max (%)
+Quarterly Payout (%)
+Annual Payout (%)
+
+0
+10
+0.5
+0.25
+
+10
+20
+1.0
+0.50
+
+20
+30
+1.5
+0.75
+
+30
+999999 (auto-derived)
+2.0
+1.00
+
+
+Phase 3 — Nested IF Excel Formula Generation
+The _build_disc_formula() function reads the parsed slab brackets and constructs a nested Excel IF formula string. This formula is written into every cell of the Discount % column in the Final Summary sheet. For a four-bracket slab, the formula for row 4:
+
+  =IF(H4<10.0, 0.5, IF(H4<20.0, 1.0, IF(H4<30.0, 1.5, 2.0)))
+
+  H4 = Growth % cell in the same row.
+  Formula is DYNAMIC — built from the actual uploaded slab file.
+  If slab rates change next quarter, the formula changes automatically.
+
+  Complete recalculation chain when user edits Q-prev in Excel:
+    Increase = Q-curr - Q-prev          (recalculates)
+    Growth % = IF(Q-prev=0,0,Incr/Q-prev*100)   (recalculates)
+    Discount % = IF(H<10,0.5,IF(H<20,1.0,...))  (re-evaluates slab)
+    Discount Value = Q-curr * Disc% / 100        (recalculates)
+
+
+
+3.6 Customer Name Deduplication Logic
+A UAT observation identified that some dealers appear in the output as two separate rows with doubled revenue. This occurs because the same Customer Number has different Customer Names across quarters — for example, one file has 'ABC Motors Pvt Ltd' while another has 'ABC Motors Pvt Ltd (formerly known as XYZ Dealers)'.
+
+The deduplication logic, applied in Step 7 before the pivot operation, works as follows:
+
+  1. Build a mapping: Customer Number → first Customer Name found
+  2. For each name, strip parenthetical text using regex:
+     re.sub(r'\s*\(.*?\)\s*', '', name)
+
+     'ABC Motors (formerly known as XYZ)' → 'ABC Motors'
+     'DEF Auto (merged with GHI)'        → 'DEF Auto'
+
+  3. Apply the cleaned name to ALL rows for that Customer Number
+  4. Log the count of deduplicated names as a warning
+
+  Result: one pivot row per Customer Number, not per name variant
+
+
+
+4. Input and Output Requirements
+
+4.1 Input File Specifications
+File Slot
+Required
+Format
+Key Columns
+File Detection Keywords
+
+VLDS Main File
+Yes
+xlsx / xls / csv
+Customer Name, Customer Number, LOB, Revenue column, Fiscal Month, Line Item, Item column
+vlds, main, 4s main, sales
+
+DF & RECD File
+Yes
+xlsx
+Invoice and dealer columns for BD key construction
+df, recd, dfrecd, discount factor
+
+Previous Year Summary
+Yes
+xlsx
+Customer Number (auto-detected), Final Amount Q-prev (auto-detected)
+previous, prev, summary, last year
+
+Combined Reference File
+Yes
+xlsx (3 sheets)
+Sheet 1: Dealer codes; Sheet 2: Exclusion criteria (4 cols); Sheet 3: Slab table (4 cols)
+combined, reference
+
+Base Data
+No
+xlsx / csv
+Optional supplementary reference data
+base, reference
+
+
+4.2 Exclusion List Format (Combined File Sheet 2)
+Column
+Header Name
+Content
+Example
+
+A
+SR.NO
+Serial number (reference only)
+1, 2, 3, ...
+
+B
+Particulars/Line Item
+Text to search in the VLDS data
+CSS EDO PARTS, SYSTEM AFTERTREATMENT
+
+C
+Item Name
+Item code to search in Item column; NA if not applicable
+A0753RG, NA, N/A
+
+D
+Column where filter applied
+Specifies which VLDS column to search Particulars in
+Invoice type/Transaction type, Line Item
+
+
+4.3 Slab Table Format (Combined File Sheet 3)
+Column
+Content
+Example
+Notes
+
+A
+Quarterly Growth % lower bound
+0, 10, 20, 30
+Can contain text like '0-10%' — first number extracted
+
+B
+Quarterly Incentive Payout %
+0.5, 1.0, 1.5, 2.0
+2.0 means 2%. If 0.02, auto-converts to 2.0
+
+C
+Annual Growth % lower bound
+0, 10, 20, 30
+Same as Column A
+
+D
+Annual Incentive Payout %
+0.25, 0.5, 0.75, 1.0
+Same conversion rules as Column B
+
+
+4.4 Output Specifications
+Output
+Content
+Key Features
+
+Sheet 1: Quarterly Pivot
+One row per eligible dealer; sales by fiscal month; Grand Total column and row
+Frozen header row; alternating row shading; Grand Total with SUM formulas; month columns sorted chronologically
+
+Sheet 2: Final Summary
+Customer Name, Zone, Customer Number, Final Amount Q-curr, Final Amount Q-prev, Increase, Growth %, Discount %, Discount Value
+Increase/Growth%/Discount Value = live Excel formulas; Discount% = nested IF from slab brackets; Grand Total with SUM and SUMPRODUCT formulas; editing any value triggers chain recalculation
+
+Sheet 3: Eligible Data
+Full transaction-level eligible dataset with all original columns plus Remark column and Exclusion List column
+AutoFilter on all columns; Exclusion List column renamed from any source variant; Remark shows 'Exclusion List - [item name]' for excluded rows
+
+Audit Log (.txt)
+Step-by-step processing log with row counts, exclusion audit report, slab details, revenue impact analysis
+[OK]/[WARN]/[ERR] entries; per-item exclusion audit; revenue before/after comparison; downloadable with every run
+
+
+
+5. Data Sources and Dependencies
+
+5.1 External Data Sources
+Data Source
+Provided By
+Update Frequency
+Used In
+
+VLDS Main File
+Sales Management System export
+Every quarter after quarter close
+Steps 1–8: primary transaction data
+
+DF & RECD File
+Finance team DF process output
+Every quarter
+Step 5: BD key matching exclusion
+
+Previous Year Summary
+Prior year VLDS output archive
+Every quarter — same quarter, prior year
+Step 8: growth percentage baseline
+
+Dealer List (Sheet 1)
+Finance team maintains
+When dealer network changes
+Step 2: 4S eligibility filter
+
+Exclusion List (Sheet 2)
+Finance team maintains
+Each quarter per scheme guidelines
+Step 4: dynamic exclusion filtering
+
+Slab Table (Sheet 3)
+Finance team maintains
+When scheme incentive rates change
+Step 8: Discount % lookup and formula
+
+
+5.2 In-Memory Data Flow
+DataFrame
+Created In
+Source
+Passed To
+Rows Effect
+
+df_raw
+Step 1
+VLDS Main File
+Step 2
+All rows loaded
+
+df_4s
+Step 2
+df_raw + Dealer List
+Step 3
+Non-4S rows removed
+
+df_lob
+Step 3
+df_4s
+Step 4
+Non-PARTS/HIGHWAY removed
+
+df_excl_out
+Step 4
+df_lob + Exclusion List
+Step 5
+Excluded items flagged with remark
+
+df_recd_out
+Step 5
+df_excl_out + DF-RECD
+Step 6
+BD-matched rows flagged
+
+df_eligible
+Step 6
+df_recd_out (remark = empty)
+Step 7
+Only eligible rows — for pivot
+
+df_full
+Step 6
+df_recd_out (all rows)
+Step 9 Sheet 3
+All rows with remarks — for audit
+
+df_pivot
+Step 7
+df_eligible (deduplicated names)
+Step 8
+One row per dealer
+
+df_summary
+Step 8
+df_pivot + Prev Year + Slab
+Step 9 Sheet 2
+With all incentive columns
+
+
+5.3 Software Dependencies
+Library
+Version
+Role in System
+
+Python
+3.10+
+Core application runtime — all processing and UI logic
+
+pandas
+2.x
+DataFrame operations: read_excel, read_csv, merge, pivot_table, groupby, filtering
+
+xlsxwriter
+3.x
+Excel output generation with write_formula() for live formulas and full formatting control
+
+openpyxl
+3.x
+Reading .xlsx input files
+
+xlrd
+2.x
+Reading legacy .xls format files
+
+tkinter
+Built-in
+Desktop GUI: file pickers, dropdowns, radio buttons, progress bar, labels, buttons
+
+Pillow
+10.x
+Loading logo.PNG as application window icon
+
+PyInstaller
+5.x
+Packaging into standalone Windows .exe with bundled Python runtime
+
+re (regex)
+Built-in
+Slab cell numeric extraction; customer name parenthetical text stripping
+
+io (BytesIO)
+Built-in
+In-memory file buffers for combined file sheet extraction and xlsx output
+
+threading + queue
+Built-in
+Background processing thread and thread-safe main-thread UI updates
+
+
+
+6. Logic and Business Rules Implemented
+
+6.1 Dealer Code Normalisation
+Applied before every join/merge operation. The _norm_key() function converts all dealer codes to a consistent string format by stripping the .0 decimal suffix that appears when Excel exports integer codes as floats. For example, '12345.0' becomes '12345', and '67890.00' becomes '67890'. Codes already in clean format are left unchanged. This normalisation is applied to both sides of every matching operation.
+
+6.2 4S Dealer Eligibility (Step 2)
+Only dealers present in the 4S Dealer List (Combined Reference File Sheet 1) are eligible for VLDS incentive. The matching is performed as an inner join on the normalised dealer code column. Dealers in the VLDS data not present in the 4S list are removed and counted in the audit log.
+
+6.3 LOB Eligibility (Step 3)
+Only transactions in the PARTS and HIGHWAY Lines of Business are eligible. The LOB column is identified by keyword matching, and rows are filtered using a case-insensitive string comparison. All non-PARTS and non-HIGHWAY rows are removed.
+
+6.4 Exclusion List Application (Step 4)
+This is the most complex filtering step and uses the four-column exclusion format described in Section 3.4. Each exclusion row specifies what to search for and where to search. The processing rules are:
+
+If Item Name is NA or N/A or blank: search the Particulars value in the column identified by 'Column where filter applied'. This handles cases like searching 'CSS EDO PARTS' in the Invoice Type column.
+If Item Name has a real value (e.g., 'A0753RG'): search the Item Name in the Item column of the VLDS data AND search the Particulars in the Line Item column. Either match flags the row.
+Flagged rows receive the remark 'Exclusion List - [Particulars value]' for traceability.
+Rows already flagged by a prior exclusion rule are not double-counted.
+A complete per-item audit is generated showing matched rules, unmatched rules, and revenue impact.
+
+6.5 DF-RECD Matching (Step 5)
+The DF and RECD file identifies specific invoice records for exclusion. A composite BD key is constructed from multiple identifying columns in both the VLDS data and the DF-RECD file. Both sides of the key are normalised using _norm_key() before comparison. Records in the VLDS data whose BD key appears in the DF-RECD file are flagged with an appropriate remark.
+
+6.6 Customer Name Deduplication (Step 7)
+Before the quarterly pivot is built, customer names are deduplicated by Customer Number. A regex pattern strips parenthetical text such as '(formerly known as XYZ Dealers)' from customer names. All rows for the same Customer Number are then assigned the cleaned version of the name. This prevents the same dealer from appearing as two separate rows in the pivot output, which would double their revenue figure and inflate the Grand Total.
+
+6.7 Growth % and Incentive Calculation (Step 8)
+Calculation
+Formula
+Protection
+Written As
+
+Increase
+Final Amount Q-curr minus Final Amount Q-prev
+N/A
+Live Excel formula: =C4-D4
+
+Growth %
+(Increase / Final Amount Q-prev) * 100
+IF Q-prev = 0, Growth % = 0 (division-by-zero)
+Live Excel formula: =IF(D4=0,0,E4/D4*100)
+
+Discount %
+Slab bracket lookup on Growth %
+Last bracket catches all values above highest threshold
+Nested IF Excel formula from slab brackets
+
+Discount Value
+Final Amount Q-curr * Discount % / 100
+N/A
+Live Excel formula: =C4*G4/100
+
+Grand Total — Increase
+SUM of Q-curr range minus SUM of Q-prev range
+N/A
+Excel SUM formula
+
+Grand Total — Discount Value
+SUMPRODUCT(Q-curr range, Disc% range) / 100
+N/A
+Excel SUMPRODUCT formula
+
+
+
+7. Exception Handling and Validations
+
+7.1 Input Validations
+Validation
+When
+Method
+User Feedback
+
+File type mismatch detection
+On every file Browse
+Filename keyword scoring — scores compared across all slots
+Yellow warning in filename display; does not block processing
+
+File size check
+On Browse — before storing path
+Size compared against 200 MB limit
+Warning message; file not stored if exceeds limit
+
+Combined file sheet count
+On Run click — before Step 1
+pd.ExcelFile().sheet_names count check
+Error dialog: 'Must have at least 3 sheets'; processing halted
+
+Slab table emptiness
+After parse_slab()
+DataFrame empty check
+Error dialog with message; processing halted
+
+Required files presence
+Continuous — every file change
+All REQ slots checked in session state
+Run button disabled until all required files present; missing files listed
+
+Previous year column detection
+On Previous Year file upload
+Keyword scan of column headers
+Green info box when detected; orange when uncertain
+
+
+7.2 Processing Exception Handling
+Exception
+Detection
+Handling
+Log Entry
+
+Input file unreadable
+try-except around file read operations
+Return empty DataFrame; halt if critical
+[ERR] with filename and exception message
+
+Revenue column not detected
+Keyword scan returns no match
+Fallback to last numeric column
+[WARN] with fallback column name
+
+Prev year dealer not found
+LEFT JOIN returns NaN for Q-prev
+NaN filled with 0; Growth % set to 0
+[WARN] per unmatched dealer — count logged
+
+Division by zero in Growth %
+IF condition in Python and Excel formula
+Return 0 — mathematically correct
+Silent — no log entry needed
+
+Exclusion target column not found
+Column name not matched by fcol()
+Skip that exclusion rule; log warning
+[WARN] — target column not found for exclusion item
+
+Exception in processing thread
+try-except around entire _worker()
+Error message sent via Queue to main thread
+Error dialog with first 1500 chars of traceback
+
+xlsxwriter write failure
+try-except around step9
+Processing halted; error propagated to UI
+[ERR] with exception detail
+
+Customer name dedup regex failure
+try-except around re.sub
+Use original name if regex fails
+[WARN] — dedup failed for specific customer
+
+
+
+8. Tools and Technologies Used
+
+Component
+Technology
+Version
+Purpose in VLDS System
+
+Core Language
+Python
+3.10
+All application logic — processing pipeline, file parsing, UI, threading
+
+Data Processing
+pandas
+2.x
+DataFrame operations: read_excel, read_csv, merge, pivot_table, groupby, filtering, string operations
+
+Excel Output
+xlsxwriter
+3.x
+Writing formatted .xlsx with write_formula() for live Excel formulas and write_string() for text cells
+
+Excel Input
+openpyxl
+3.x
+Reading .xlsx input files with full support for merged cells and formatting
+
+Legacy Excel
+xlrd
+2.x
+Reading .xls format files that predate the .xlsx format
+
+GUI Framework
+tkinter
+Built-in
+Desktop interface: file browser dialogs, combobox dropdowns, radio buttons, progress bar, labels, buttons
+
+Image Library
+Pillow
+10.x
+Loading logo.PNG as the application window icon
+
+Deployment
+PyInstaller
+5.x
+Bundling Python runtime and all libraries into a single standalone Windows .exe file
+
+Regex Engine
+re
+Built-in
+Slab cell numeric extraction; customer name parenthetical text removal
+
+Memory Buffers
+io.BytesIO
+Built-in
+In-memory file buffers for combined file sheet extraction and xlsx output before save
+
+Threading
+threading + queue
+Built-in
+Background processing in worker thread with thread-safe Queue for UI updates on main thread
+
+Code Editor
+Visual Studio Code
+Latest
+Development IDE for all Python source code
+
+Version Control
+Git
+Latest
+Source code version management
+
+
+
+9. Assumptions and Limitations
+
+9.1 Assumptions
+The VLDS Main File contains at least one column identifiable as Revenue by keyword matching (revenue, sales, net, amount). Fallback: last numeric column is used.
+Dealer codes may appear in integer or float format across different files. The system normalises both sides before every matching operation.
+The Combined Reference File has at least three sheets. Sheets are mapped by keyword in their names or by position (1st = Dealer, 2nd = Exclusion, 3rd = Slab) if names contain no recognisable keywords.
+The Previous Year Summary file is the output from a prior VLDS processing run for the same quarter of the previous year.
+Slab payout values stored as decimal fractions (e.g., 0.02) represent percentages (2%). Auto-conversion is applied when all payout values are below 0.10.
+The Exclusion List Sheet 2 follows the four-column format: SR.NO, Particulars/Line Item, Item Name, Column where filter applied.
+Microsoft Excel 2016 or later is required on the client machine to open the output report and use the live formula functionality.
+The application is used by a single operator at a time. No concurrent multi-user processing is supported.
+Customer names containing parenthetical text like '(formerly known as ...)' represent the same entity as the name without the parenthetical text.
+
+9.2 Limitations
+Limitation
+Detail
+Workaround
+
+Discount % static after generation
+Nested IF formula reflects slab at generation time. If slab is updated after report generation, old formula remains.
+Re-run the application with the updated slab file.
+
+Single-quarter processing
+No batch mode for multiple quarters or annual aggregation.
+Run four times (once per quarter); consolidate manually.
+
+200 MB file size limit
+Very large files may exceed this limit.
+Split input files before processing.
+
+Windows 10/11 64-bit only
+macOS and Linux not supported in the .exe format.
+Run on a Windows machine.
+
+Prev year auto-detection
+Non-standard column names may cause wrong column selection.
+Verify auto-detected columns in UI before clicking Run.
+
+Exclusion text matching
+Uses case-insensitive substring matching — may match unintended items if exclusion text is too generic.
+Use specific, unique Particulars text in the exclusion list.
+
+Customer name dedup
+Regex strips ALL parenthetical text — may affect names where parentheses are part of the actual name.
+Verify deduplicated names in the pivot output.
+
+
+
+10. User Interface Details
+
+10.1 Main Window Layout
+The application window opens maximised on Windows. It is divided into two panels: Input Files (left, ~55% width) and Report Settings + Actions (right, ~45% width).
+
+Element
+Location
+Behaviour
+
+Topbar
+Top full width
+Dark blue (#3D4F63) background with Canyon red (#C4622D) left accent. Shows application title, organisation name, and version pill badge.
+
+File label + REQ/OPT badge
+Left panel, each row
+File name in bold dark blue. REQ badge in Canyon red for required files; OPT in grey for optional.
+
+Filename display
+Left panel, middle
+Grey italic 'No file selected' when empty. Green with tick when loaded. Orange with warning when filename mismatch detected.
+
+Browse button
+Left panel, right
+Canyon red (#C4622D) background, white text. Opens Windows file browser filtered to Excel/CSV.
+
+Remove button (✕)
+Right of Browse
+Light red (#FEE2E2) background. Clears file and resets display.
+
+Quarter / Year dropdowns
+Right panel, settings
+Q1–Q4 and 2022–2032 selections using ttk.Combobox.
+
+Custom Year input
+Right panel, settings
+Overrides year dropdown when valid 4-digit year entered.
+
+Payout Type radio
+Right panel, settings
+Quarterly (default) or Annual. Determines which slab column is used.
+
+Auto-detect info box
+Right panel, below settings
+Green when columns detected; orange when uncertain. Shows Customer ID and Sales Amount column names.
+
+Run button
+Right panel, actions
+Canyon red when active; grey when disabled. Shows 'Processing...' during run. Yellow warning banner appears.
+
+Progress bar
+Below Run
+ttk.Progressbar advancing through 9 steps. Step name shown as label below.
+
+Save Report / Save Log
+Right panel
+Green (#5C7A4E) and dark blue buttons. Active after successful run. Open Save dialog.
+
+Statistics display
+Right panel, bottom
+Dark blue card showing Total Rows, Eligible, Excluded, Sales (Cr) with colour-coded values.
+
+Footer
+Bottom full width
+Dark blue bar with application credit text.
+
+
+10.2 Output Excel Report — Sheet Structure
+Sheet
+Title Row
+Header Row
+Data Rows
+Special Features
+
+Sheet 1: Quarterly Pivot
+VLDS [Quarter]-[Year] — Quarterly Pivot
+Customer Name, Customer Number, month columns, Grand Total
+One row per dealer; all numeric formatted
+Frozen header row; alternating shading; Grand Total row with SUM
+
+Sheet 2: Final Summary
+VLDS [Quarter]-[Year] — Final Incentive Summary
+Customer Name, Zone, Number, Q-curr, Q-prev, Increase, Growth%, Disc%, Disc Value
+One row per dealer
+Columns E–I contain live Excel formulas; nested IF for Disc%; Grand Total row
+
+Sheet 3: Eligible Data
+VLDS [Quarter]-[Year] — Eligible Data
+All original columns plus Remark and Exclusion List
+All eligible transaction rows
+AutoFilter on all columns; Exclusion List renamed; Remark shows exclusion reason
+
+
+
+11. Deployment Approach and User Instructions
+
+11.1 Building the Executable
+The application is packaged using PyInstaller from the development machine. The build bundles Python 3.10, all libraries, all modules, and the logo file into a single .exe of approximately 40–60 MB.
+
+  Build Steps:
+  1. Open Command Prompt in the project folder
+  2. Delete old build: rmdir /s /q dist build
+  3. Run PyInstaller:
+     pyinstaller --onefile --noconsole --name VLDS_Automation
+       --add-data modules;modules --add-data logo.PNG;.
+       --hidden-import pandas --hidden-import openpyxl
+       --hidden-import xlsxwriter --hidden-import xlrd
+       --paths . --paths modules app_tk.py
+  4. Output: dist/VLDS_Automation.exe
+
+
+11.2 Client Machine Requirements
+Requirement
+Specification
+
+Operating System
+Windows 10 or Windows 11 (64-bit)
+
+Python
+NOT required — bundled inside the .exe
+
+Microsoft Excel
+2016 or later — for opening the output report and using live formulas
+
+RAM
+4 GB minimum; 8 GB recommended for large files
+
+Disk Space
+500 MB for the .exe; additional space for input and output files
+
+Network
+Not required — application runs fully offline
+
+Antivirus
+May require one-time exception on first launch of the .exe
+
+
+11.3 Step-by-Step User Instructions
+Step 1 — Launch
+Copy VLDS_Automation.exe to Desktop or project folder. Double-click to launch. On first launch, Windows SmartScreen may warn — click 'More info' then 'Run anyway'.
+
+Step 2 — Upload Files
+Click Browse next to VLDS Main File — select the quarterly sales export.
+Click Browse next to DF & RECD File — select the DF-RECD exclusion records.
+Click Browse next to Previous Year Summary — select the same quarter from last year.
+Click Browse next to Combined File — select the 3-sheet reference workbook.
+Verify the auto-detected columns shown in the green info box are correct.
+
+Step 3 — Configure
+Select Quarter (Q1–Q4) and Year, or type a custom year.
+Select Payout Type: Quarterly or Annual.
+
+Step 4 — Run
+Click the Run button. Processing runs in background. Progress bar advances through 9 steps. A yellow banner advises not to close the window. Wait for completion.
+
+Step 5 — Save and Verify
+Click Save Report — choose location — saves .xlsx output.
+Click Save Log — saves .txt audit log.
+Open the log file and review the EXCLUSION AUDIT REPORT section to verify all exclusion items matched correctly and the revenue impact is as expected.
+Open the Excel report. On Sheet 2 (Final Summary), verify the Grand Total revenue matches stakeholder expectations.
+
+Step 6 — Post-Generation Editing
+To correct any value in the Final Summary: click the cell, type the new value, press Enter. All formula columns in that row recalculate automatically. No re-run of the application is needed for such corrections.
+
+11.4 Quarterly Checklist
+#
+Task
+When
+Who
+
+1
+Update Exclusion List (Sheet 2 of Combined File) with current quarter criteria
+Start of quarter
+Finance Analyst
+
+2
+Update Slab Table (Sheet 3) if incentive rates have changed
+Start of quarter
+Finance Manager
+
+3
+Export VLDS Main File from sales system
+After quarter close
+Finance Analyst
+
+4
+Obtain DF & RECD File for the quarter
+After quarter close
+Finance Analyst
+
+5
+Retrieve Previous Year Summary from archive
+Before running
+Finance Analyst
+
+6
+Run VLDS Automation — upload files, configure, click Run
+After all files ready
+Finance Analyst
+
+7
+Download and review the audit log — check exclusion report, revenue impact
+After run
+Finance Analyst
+
+8
+Verify Grand Total in Final Summary matches stakeholder expectation
+After run
+Finance Analyst
+
+9
+If revenue is higher than expected: check UNMATCHED items in log — these exclusions did not filter any rows
+If mismatch found
+Finance Analyst
+
+10
+Save Report and Log to quarterly archive folder
+After verification
+Finance Analyst
+
+
+11.5 Troubleshooting
+Issue
+Likely Cause
+Solution
+
+Revenue higher than expected in Final Summary
+Some exclusion items did not match any rows
+Download log → check UNMATCHED ITEMS section → verify spelling in exclusion file matches VLDS data exactly
+
+Same dealer appears as two rows in pivot
+Customer name differs between files (e.g., with 'formerly known as')
+Deduplication should handle this; if still occurring, check the log for dedup count; verify Customer Number is identical
+
+Run button stays disabled
+One required file not loaded
+Click ✕ on each file and re-upload all files
+
+Slab table error on Run
+Sheet 3 of Combined file has no numeric data rows
+Verify columns A-D have numbers; check for blank rows above data
+
+Growth % all zeros
+Previous year dealer codes not matching current year
+Check dealer code format between files; normalisation should handle .0 suffix
+
+Discount % not changing when Growth % edited in Excel
+Nested IF formula references wrong column
+Re-run with current files — formula column letter is computed dynamically
+
+App closes on launch
+Antivirus blocking .exe
+Add to exclusion list; right-click Properties → Unblock
+
+Excel shows #REF! errors
+Excel version earlier than 2016
+Use Excel 2016 or later
